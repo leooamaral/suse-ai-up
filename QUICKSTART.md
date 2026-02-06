@@ -65,7 +65,7 @@ kubectl get svc suse-ai-up-service -n suse-ai-up -o jsonpath='{.status.loadBalan
 
 ## Setup SUSE AI Universal Proxy UI
 
-1. In Rancher, add repository: `https://github.com/suse/suse-ai-up-ext`(branch: v0.1.0)
+1. In Rancher, add repository: `https://github.com/suse/suse-ai-up-ext`(branch: stable)
 2. Go to Extensions
 3. Find and install "SUSE AI Universal Proxy"
 
