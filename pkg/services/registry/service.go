@@ -27,19 +27,20 @@ import (
 
 // Service represents the registry service
 type Service struct {
-	config                 *Config
-	server                 *http.Server
-	store                  clients.MCPServerStore
-	adapterStore           clients.AdapterResourceStore
-	adapterService         *adaptersvc.AdapterService
-	userStore              clients.UserStore
-	groupStore             clients.GroupStore
-	userGroupService       *services.UserGroupService
-	userGroupHandler       *handlers.UserGroupHandler
-	routeAssignmentHandler *handlers.RouteAssignmentHandler
-	syncManager            *SyncManager
-	sidecarManager         *proxy.SidecarManager
-	shutdownCh             chan struct{}
+	config                      *Config
+	server                      *http.Server
+	store                       clients.MCPServerStore
+	adapterStore                clients.AdapterResourceStore
+	adapterGroupAssignmentStore clients.AdapterGroupAssignmentStore
+	adapterService              *adaptersvc.AdapterService
+	userStore                   clients.UserStore
+	groupStore                  clients.GroupStore
+	userGroupService            *services.UserGroupService
+	userGroupHandler            *handlers.UserGroupHandler
+	routeAssignmentHandler      *handlers.RouteAssignmentHandler
+	syncManager                 *SyncManager
+	sidecarManager              *proxy.SidecarManager
+	shutdownCh                  chan struct{}
 }
 
 // Config holds registry service configuration
@@ -100,27 +101,28 @@ func NewService(config *Config) *Service {
 	}
 
 	service := &Service{
-		config:         config,
-		store:          clients.NewInMemoryMCPServerStore(),
-		adapterStore:   clients.NewInMemoryAdapterStore(),
-		userStore:      clients.NewInMemoryUserStore(),
-		groupStore:     clients.NewInMemoryGroupStore(),
-		sidecarManager: sidecarManager,
-		shutdownCh:     make(chan struct{}),
+		config:                      config,
+		store:                       clients.NewInMemoryMCPServerStore(),
+		adapterStore:                clients.NewInMemoryAdapterStore(),
+		adapterGroupAssignmentStore: clients.NewInMemoryAdapterGroupAssignmentStore(),
+		userStore:                   clients.NewInMemoryUserStore(),
+		groupStore:                  clients.NewInMemoryGroupStore(),
+		sidecarManager:              sidecarManager,
+		shutdownCh:                  make(chan struct{}),
 	}
 
 	// Initialize user/group service
 	service.userGroupService = services.NewUserGroupService(service.userStore, service.groupStore)
 
+	// Initialize adapter service (sidecar manager will be set later if available)
+	service.adapterService = adaptersvc.NewAdapterService(service.adapterStore, service.adapterGroupAssignmentStore, service.store, service.sidecarManager)
+
 	// Initialize handlers
-	service.userGroupHandler = handlers.NewUserGroupHandler(service.userGroupService)
+	service.userGroupHandler = handlers.NewUserGroupHandler(service.userGroupService, service.adapterService)
 	service.routeAssignmentHandler = handlers.NewRouteAssignmentHandler(service.userGroupService, service)
 
 	// Initialize sync manager
 	service.syncManager = NewSyncManager(service.store)
-
-	// Initialize adapter service (sidecar manager will be set later if available)
-	service.adapterService = adaptersvc.NewAdapterService(service.adapterStore, service.store, service.sidecarManager)
 
 	return service
 }

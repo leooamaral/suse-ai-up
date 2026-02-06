@@ -16,7 +16,7 @@ replicaCount: 1
 # Image configuration
 image:
   registry: ghcr.io
-  repository: suse/uniproxy
+  repository: alessandro-festa/uniproxy
   tag: "latest"
   pullPolicy: IfNotPresent
 
@@ -252,10 +252,14 @@ networkPolicy:
 
 # Persistence Configuration
 persistence:
-  enabled: false
+  enabled: true
   accessMode: ReadWriteOnce
-  size: 10Gi
+  size: 2Gi
   storageClass: ""
+  # Optional: Encryption key for storage encryption (minimum 16 characters)
+  # If not provided, data will be stored unencrypted
+  # It is recommended to provide this via a Secret in production
+  encryptionKey: "myencryptionkey123456"
 
 # Logging Configuration
 logging:
@@ -337,13 +341,8 @@ registry:
   # Enable loading servers from YAML file
   enabled: true
 
-  # External registry URL (if set, will fetch registry from URL instead of ConfigMap)
-  # Leave empty to use ConfigMap-based registry
-  url: ""
-
-  # Timeout for registry URL fetch (only used when url is set)
-  timeout: "30s"
-
+  # List of custom registry sources to sync from (can include authenticated Git repositories)
+  # Each source can specify a URL and optional authentication details.
   # MCP servers configuration (will be loaded into ConfigMap)
   servers: |
     - name: uyuni
@@ -480,6 +479,7 @@ registry:
             name: trento-mcp-server.port
             type: text
             templated: true
+  url: ""
 # Sidecar Configuration for MCP servers
 sidecar:
   enabled: true

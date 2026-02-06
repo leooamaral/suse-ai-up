@@ -10,7 +10,7 @@ data:
   swagger.yaml: |
 {{ .Files.Get "docs/swagger.yaml" | indent 4 }}
 ---
-{{- if .Values.registry.enabled }}
+{{- if and .Values.registry.enabled (not .Values.registry.url) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -441,16 +442,37 @@ func RunUniproxy() {
 	}
 
 	// Initialize stores
-	// Use file-based adapter store for persistence
-	adapterStore := clients.NewFileAdapterStore("/tmp/adapters.json")
+	// Initialize crypto for storage encryption
+	crypto, err := clients.NewStorageCrypto(cfg.StorageEncryptionKey)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize storage encryption: %v. Data will be stored unencrypted.", err)
+	} else if cfg.StorageEncryptionKey != "" {
+		log.Printf("Storage encryption enabled")
+	}
+
+	// Ensure data directory exists
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		log.Fatalf("Failed to create data directory %s: %v", cfg.DataDir, err)
+	}
+
+	// Use file-based stores for persistence
+	adapterStorePath := filepath.Join(cfg.DataDir, "adapters.json")
+	adapterGroupAssignmentStorePath := filepath.Join(cfg.DataDir, "adapter_assignments.json")
+	userStorePath := filepath.Join(cfg.DataDir, "users.json")
+	groupStorePath := filepath.Join(cfg.DataDir, "groups.json")
+	mcpServerStorePath := filepath.Join(cfg.DataDir, "mcp_servers.json")
+
+	adapterStore := clients.NewFileAdapterStore(adapterStorePath, crypto)
+	adapterGroupAssignmentStore := clients.NewFileAdapterGroupAssignmentStore(adapterGroupAssignmentStorePath, crypto)
+
 	tokenManager, err := auth.NewTokenManager("mcp-gateway")
 	if err != nil {
 		log.Fatalf("Failed to create token manager: %v", err)
 	}
 
-	// Initialize user/group system with admin defaults
-	userStore := clients.NewInMemoryUserStore()
-	groupStore := clients.NewInMemoryGroupStore()
+	// Initialize user/group system with file storage
+	userStore := clients.NewFileUserStore(userStorePath, crypto)
+	groupStore := clients.NewFileGroupStore(groupStorePath, crypto)
 	userGroupService := services.NewUserGroupService(userStore, groupStore)
 
 	// Create user auth configuration
@@ -602,12 +624,12 @@ func RunUniproxy() {
 	mcpAuthHandler := handlers.NewMCPAuthHandler(adapterStore, nil)
 
 	// Initialize missing handlers
-	registryStore := clients.NewInMemoryMCPServerStore()
+	registryStore := clients.NewFileMCPServerStore(mcpServerStorePath, crypto)
 	registryManager := handlers.NewDefaultRegistryManager(registryStore)
 
 	// Initialize AdapterService with SidecarManager
 	logging.ProxyLogger.Info("Initializing AdapterService with SidecarManager")
-	adapterService := adaptersvc.NewAdapterService(adapterStore, registryStore, sidecarManager)
+	adapterService := adaptersvc.NewAdapterService(adapterStore, adapterGroupAssignmentStore, registryStore, sidecarManager)
 	logging.ProxyLogger.Info("AdapterService created: %v", adapterService != nil)
 	adapterHandler := handlers.NewAdapterHandler(adapterService, userGroupService)
 	logging.ProxyLogger.Info("AdapterHandler created: %v", adapterHandler != nil)
@@ -638,7 +660,7 @@ func RunUniproxy() {
 	registryHandler := handlers.NewRegistryHandler(registryStore, registryManager, adapterStore, userGroupService, cfg, k8sClient)
 
 	// Initialize user/group and route assignment handlers
-	userGroupHandler := handlers.NewUserGroupHandler(userGroupService)
+	userGroupHandler := handlers.NewUserGroupHandler(userGroupService, adapterService)
 	authHandler := handlers.NewAuthHandler(userAuthService)
 	routeAssignmentHandler := handlers.NewRouteAssignmentHandler(userGroupService, registryStore)
 	logging.ProxyLogger.Info("UserGroupHandler created: %v", userGroupHandler != nil)
@@ -718,10 +740,19 @@ func RunUniproxy() {
 			adapters.DELETE("/:name", ginToHTTPHandler(adapterHandler.DeleteAdapter))
 			adapters.POST("/:name/health", ginToHTTPHandler(adapterHandler.CheckAdapterHealth))
 
+			// Group assignments
+			adapters.POST("/:name/groups", ginToHTTPHandler(adapterHandler.AssignAdapterToGroup))
+			adapters.DELETE("/:name/groups/:groupId", ginToHTTPHandler(adapterHandler.RemoveAdapterFromGroup))
+			adapters.GET("/:name/groups", ginToHTTPHandler(adapterHandler.ListAdapterGroupAssignments))
+
 			// Token management
 			adapters.GET("/:name/token", tokenHandler.GetAdapterToken)
 			adapters.POST("/:name/token/validate", tokenHandler.ValidateToken)
 			adapters.POST("/:name/token/refresh", tokenHandler.RefreshToken)
+
+			// User config
+			logging.ProxyLogger.Info("Registering user config route")
+			v1.GET("/user/config", ginToHTTPHandler(adapterHandler.GetClientConfig))
 
 			// Authentication
 			adapters.GET("/:name/client-token", mcpAuthHandler.GetClientToken)
@@ -830,6 +861,7 @@ func RunUniproxy() {
 			// Read operations - no auth required
 			groups.GET("", ginToHTTPHandler(userGroupHandler.HandleGroups))
 			groups.GET("/:id", ginToHTTPHandler(userGroupHandler.GetGroup))
+			groups.GET("/:id/adapters", ginToHTTPHandler(userGroupHandler.ListGroupAdapters))
 
 			// Write operations - require authentication
 			protectedGroups := groups.Group("")

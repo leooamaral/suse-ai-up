@@ -82,14 +82,70 @@ func (ugs *UserGroupService) DeleteGroup(ctx context.Context, id string) error {
 	return ugs.groupStore.Delete(ctx, id)
 }
 
-// AddUserToGroup adds a user to a group
+// AddUserToGroup adds a user to a group (updates both group.Members and user.Groups)
 func (ugs *UserGroupService) AddUserToGroup(ctx context.Context, groupID, userID string) error {
-	return ugs.groupStore.AddMember(ctx, groupID, userID)
+	// First, add user to group's Members list
+	if err := ugs.groupStore.AddMember(ctx, groupID, userID); err != nil {
+		return err
+	}
+
+	// Then, add group to user's Groups list
+	user, err := ugs.userStore.Get(ctx, userID)
+	if err != nil {
+		// Rollback: remove user from group since we can't update user
+		ugs.groupStore.RemoveMember(ctx, groupID, userID)
+		return fmt.Errorf("failed to get user for group update: %w", err)
+	}
+
+	// Check if group is already in user's Groups
+	for _, g := range user.Groups {
+		if g == groupID {
+			return nil // Already added, nothing to do
+		}
+	}
+
+	// Add group to user's Groups
+	user.Groups = append(user.Groups, groupID)
+	if err := ugs.userStore.Update(ctx, *user); err != nil {
+		// Rollback: remove user from group since update failed
+		ugs.groupStore.RemoveMember(ctx, groupID, userID)
+		return fmt.Errorf("failed to update user groups: %w", err)
+	}
+
+	return nil
 }
 
-// RemoveUserFromGroup removes a user from a group
+// RemoveUserFromGroup removes a user from a group (updates both group.Members and user.Groups)
 func (ugs *UserGroupService) RemoveUserFromGroup(ctx context.Context, groupID, userID string) error {
-	return ugs.groupStore.RemoveMember(ctx, groupID, userID)
+	// First, remove user from group's Members list
+	if err := ugs.groupStore.RemoveMember(ctx, groupID, userID); err != nil {
+		return err
+	}
+
+	// Then, remove group from user's Groups list
+	user, err := ugs.userStore.Get(ctx, userID)
+	if err != nil {
+		// User not found, but we already removed from group - that's the main operation
+		return nil
+	}
+
+	// Find and remove group from user's Groups
+	found := false
+	for i, g := range user.Groups {
+		if g == groupID {
+			user.Groups = append(user.Groups[:i], user.Groups[i+1:]...)
+			found = true
+			break
+		}
+	}
+
+	if found {
+		if err := ugs.userStore.Update(ctx, *user); err != nil {
+			return fmt.Errorf("failed to update user groups: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // CanAccessServer checks if a user can access a server based on route assignments
@@ -101,17 +157,17 @@ func (ugs *UserGroupService) CanAccessServer(ctx context.Context, userID, server
 	}
 
 	// Check if user has admin permissions (can access all servers)
-	if ugs.hasPermission(user.Groups, "server:*") {
+	if ugs.HasPermission(user.Groups, "server:*") {
 		return true, nil
 	}
 
 	// Check specific server access permissions
-	if ugs.hasPermission(user.Groups, fmt.Sprintf("server:%s:*", serverID)) {
+	if ugs.HasPermission(user.Groups, fmt.Sprintf("server:%s:*", serverID)) {
 		return true, nil
 	}
 
 	// Check read access to the server
-	if ugs.hasPermission(user.Groups, fmt.Sprintf("server:%s:read", serverID)) {
+	if ugs.HasPermission(user.Groups, fmt.Sprintf("server:%s:read", serverID)) {
 		return true, nil
 	}
 
@@ -130,7 +186,7 @@ func (ugs *UserGroupService) CanManageUsers(ctx context.Context, userID string) 
 		return false, fmt.Errorf("failed to get user: %w", err)
 	}
 
-	return ugs.hasPermission(user.Groups, "user:manage"), nil
+	return ugs.HasPermission(user.Groups, "user:manage"), nil
 }
 
 // CanManageGroups checks if a user can manage groups
@@ -145,7 +201,7 @@ func (ugs *UserGroupService) CanManageGroups(ctx context.Context, userID string)
 		return false, fmt.Errorf("failed to get user: %w", err)
 	}
 
-	return ugs.hasPermission(user.Groups, "group:manage"), nil
+	return ugs.HasPermission(user.Groups, "group:manage"), nil
 }
 
 // CanCreateAdapters checks if a user can create adapters
@@ -155,7 +211,7 @@ func (ugs *UserGroupService) CanCreateAdapters(ctx context.Context, userID strin
 		return false, fmt.Errorf("failed to get user: %w", err)
 	}
 
-	return ugs.hasPermission(user.Groups, "adapter:create"), nil
+	return ugs.HasPermission(user.Groups, "adapter:create"), nil
 }
 
 // GetUserGroups gets all groups for a user
@@ -233,8 +289,8 @@ func (ugs *UserGroupService) InitializeDefaultGroups(ctx context.Context) error 
 	return nil
 }
 
-// hasPermission checks if any of the user's groups have the specified permission
-func (ugs *UserGroupService) hasPermission(userGroups []string, permission string) bool {
+// HasPermission checks if any of the user's groups have the specified permission
+func (ugs *UserGroupService) HasPermission(userGroups []string, permission string) bool {
 	for _, groupID := range userGroups {
 		group, err := ugs.groupStore.Get(context.Background(), groupID)
 		if err != nil {
@@ -286,4 +342,19 @@ func (ugs *UserGroupService) ValidateUserID(ctx context.Context, userID string) 
 func (ugs *UserGroupService) ValidateGroupID(ctx context.Context, groupID string) error {
 	_, err := ugs.groupStore.Get(ctx, groupID)
 	return err
+}
+
+// CheckGroupPermission checks if a specific group has a permission
+func (ugs *UserGroupService) CheckGroupPermission(ctx context.Context, groupID string, permission string) (bool, error) {
+	group, err := ugs.groupStore.Get(ctx, groupID)
+	if err != nil {
+		return false, err
+	}
+
+	for _, groupPerm := range group.Permissions {
+		if ugs.permissionMatches(groupPerm, permission) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

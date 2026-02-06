@@ -22,18 +22,33 @@ type AdapterResourceStore interface {
 	UpsertAsync(adapter models.AdapterResource, ctx context.Context) error
 }
 
+// AdapterGroupAssignmentStore defines the interface for adapter group assignment storage
+type AdapterGroupAssignmentStore interface {
+	CreateAssignment(ctx context.Context, assignment models.AdapterGroupAssignment) error
+	GetAssignment(ctx context.Context, adapterID, groupID string) (*models.AdapterGroupAssignment, error)
+	UpdateAssignment(ctx context.Context, assignment models.AdapterGroupAssignment) error
+	DeleteAssignment(ctx context.Context, adapterID, groupID string) error
+	ListAssignments(ctx context.Context) ([]models.AdapterGroupAssignment, error)
+	ListAssignmentsForAdapter(ctx context.Context, adapterID string) ([]models.AdapterGroupAssignment, error)
+	ListAssignmentsForGroup(ctx context.Context, groupID string) ([]models.AdapterGroupAssignment, error)
+	// Check if a group has access to an adapter
+	HasAccess(ctx context.Context, adapterID, groupID string) (bool, error)
+}
+
 // FileAdapterStore implements AdapterResourceStore using file-based storage
 type FileAdapterStore struct {
 	filePath string
 	adapters map[string]models.AdapterResource
 	mu       sync.RWMutex
+	crypto   *StorageCrypto
 }
 
 // NewFileAdapterStore creates a new file-based adapter store
-func NewFileAdapterStore(filePath string) *FileAdapterStore {
+func NewFileAdapterStore(filePath string, crypto *StorageCrypto) *FileAdapterStore {
 	store := &FileAdapterStore{
 		filePath: filePath,
 		adapters: make(map[string]models.AdapterResource),
+		crypto:   crypto,
 	}
 
 	// Load existing adapters from file
@@ -149,6 +164,15 @@ func (s *FileAdapterStore) loadFromFile() error {
 		return nil
 	}
 
+	// Decrypt if crypto is enabled
+	if s.crypto != nil {
+		decrypted, err := s.crypto.Decrypt(data)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt adapter file: %w", err)
+		}
+		data = decrypted
+	}
+
 	var adapters []models.AdapterResource
 	if err := json.Unmarshal(data, &adapters); err != nil {
 		return fmt.Errorf("failed to parse adapter file: %w", err)
@@ -179,6 +203,15 @@ func (s *FileAdapterStore) saveToFile() error {
 	data, err := json.MarshalIndent(adapters, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal adapters: %w", err)
+	}
+
+	// Encrypt if crypto is enabled
+	if s.crypto != nil {
+		encrypted, err := s.crypto.Encrypt(data)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt adapter file: %w", err)
+		}
+		data = encrypted
 	}
 
 	// Write to temporary file first, then rename for atomicity

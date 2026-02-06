@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +42,12 @@ type CreateAdapterRequest struct {
 	EnvironmentVariables map[string]string         `json:"environmentVariables"`
 	Authentication       *models.AdapterAuthConfig `json:"authentication"`
 	DeploymentMethod     string                    `json:"deploymentMethod,omitempty"` // "helm", "docker", "systemd", "local"
+}
+
+// AddAdapterToGroupRequest represents a request to add an adapter to a group
+type AddAdapterToGroupRequest struct {
+	GroupID    string `json:"groupId" example:"mcp-users"`
+	Permission string `json:"permission" example:"read"` // "read"
 }
 
 // CreateAdapterResponse represents the response for adapter creation
@@ -100,15 +107,97 @@ func parseTrentoConfig(config string) (trentoURL, token string, err error) {
 	return urlPart, tokenPart, nil
 }
 
+// generateClientConfig creates the client-specific configuration for a given adapter
+// userID is required for per-user token generation
+func (h *AdapterHandler) generateClientConfig(adapter *models.AdapterResource, userID string, includeSecrets bool) map[string]interface{} {
+	clientConfig := make(map[string]interface{})
+
+	// Retrieve the stored MCPClientConfig from the adapter resource
+	// This contains the internal representation with real URLs and tokens
+	internalMCPClientConfig := adapter.MCPClientConfig
+
+	logging.AdapterLogger.Info("generateClientConfig: adapter=%s, user=%s, includeSecrets=%v, servers=%d", adapter.Name, userID, includeSecrets, len(internalMCPClientConfig.MCPServers))
+
+	// Assuming a single server entry per adapter for simplicity in current structure
+	var serverConfig models.MCPServerConfig
+	foundConfig := false
+	if config, ok := internalMCPClientConfig.MCPServers[adapter.Name]; ok {
+		serverConfig = config
+		foundConfig = true
+	} else {
+		// Fallback: if adapter.Name doesn't match a key, try to find any config
+		for _, cfg := range internalMCPClientConfig.MCPServers {
+			serverConfig = cfg
+			foundConfig = true
+			break
+		}
+	}
+
+	if !foundConfig || (serverConfig.URL == "" && serverConfig.Command == "") {
+		logging.AdapterLogger.Info("generateClientConfig: no valid config found for adapter %s", adapter.Name)
+		return clientConfig // Return empty if no valid server config found
+	}
+
+	// Prepare headers
+	headers := make(map[string]string)
+
+	if includeSecrets {
+		// Generate or retrieve per-user token
+		userToken, err := h.adapterService.GetOrCreateUserAdapterToken(context.Background(), userID, adapter.ID)
+		if err != nil {
+			logging.AdapterLogger.Error("Failed to generate user adapter token for user %s, adapter %s: %v", userID, adapter.ID, err)
+			// Fallback to adapter's static token
+			if adapter.Authentication != nil && adapter.Authentication.BearerToken != nil {
+				headers["Authorization"] = fmt.Sprintf("Bearer %s", adapter.Authentication.BearerToken.Token)
+			} else {
+				headers["Authorization"] = "Bearer adapter-session-token"
+			}
+		} else {
+			headers["Authorization"] = fmt.Sprintf("Bearer %s", userToken)
+			logging.AdapterLogger.Info("Generated per-user token for user %s, adapter %s", userID, adapter.ID)
+		}
+
+		// Always include X-User-ID header
+		headers["X-User-ID"] = userID
+	} else {
+		// Use placeholder for security (when listing without secrets)
+		headers["Authorization"] = "Bearer adapter-session-token"
+		headers["X-User-ID"] = userID
+	}
+
+	// Gemini Configuration
+	if serverConfig.URL != "" {
+		geminiServerConfig := map[string]interface{}{
+			"httpUrl": serverConfig.URL, // Use the URL from the stored config
+			"headers": headers,
+		}
+		clientConfig["gemini"] = map[string]interface{}{
+			"mcpServers": map[string]interface{}{
+				adapter.Name: geminiServerConfig,
+			},
+		}
+	}
+
+	// VSCode Configuration
+	// VSCode client often uses "url" field instead of "httpUrl"
+	if serverConfig.URL != "" {
+		vscodeServerConfig := map[string]interface{}{
+			"url":     serverConfig.URL, // Use the URL from the stored config
+			"headers": headers,
+			"type":    "http", // Assuming HTTP connection type for VSCode client
+		}
+		clientConfig["vscode"] = map[string]interface{}{
+			"servers": map[string]interface{}{
+				adapter.Name: vscodeServerConfig,
+			},
+			"inputs": []interface{}{}, // VSCode clients might have inputs, but not part of adapter config directly
+		}
+	}
+
+	return clientConfig
+}
+
 // HandleAdapters handles both listing and creating adapters
-// @Summary List adapters
-// @Description List all adapters for the current user
-// @Tags adapters
-// @Produce json
-// @Param X-User-ID header string false "User ID" default(default-user)
-// @Success 200 {array} models.AdapterResource "List of adapters"
-// @Failure 500 {object} ErrorResponse "Internal server error"
-// @Router /api/v1/adapters [get]
 func (h *AdapterHandler) HandleAdapters(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -121,6 +210,17 @@ func (h *AdapterHandler) HandleAdapters(w http.ResponseWriter, r *http.Request) 
 }
 
 // CreateAdapter creates a new adapter from a registry server
+// @Summary Create adapter
+// @Description Create a new MCP adapter
+// @Tags adapters
+// @Accept json
+// @Produce json
+// @Param X-User-ID header string false "User ID" default(default-user)
+// @Param request body CreateAdapterRequest true "Adapter creation request"
+// @Success 201 {object} CreateAdapterResponse "Created adapter"
+// @Failure 400 {object} ErrorResponse "Invalid request"
+// @Failure 500 {object} ErrorResponse "Internal server error"
+// @Router /api/v1/adapters [post]
 func (h *AdapterHandler) CreateAdapter(w http.ResponseWriter, r *http.Request) {
 	logging.AdapterLogger.Info("CreateAdapter handler invoked")
 
@@ -185,6 +285,7 @@ func (h *AdapterHandler) CreateAdapter(w http.ResponseWriter, r *http.Request) {
 		req.Name,
 		req.EnvironmentVariables,
 		req.Authentication,
+		h.userGroupService,
 	)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -194,67 +295,14 @@ func (h *AdapterHandler) CreateAdapter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate MCP client configurations for different client types
-	var mcpClientConfig map[string]interface{}
-	if adapter.ConnectionType == models.ConnectionTypeRemoteHttp {
-		// For remote HTTP servers, provide direct connection config
-		mcpClientConfig = map[string]interface{}{
-			"gemini": map[string]interface{}{
-				"mcpServers": map[string]interface{}{
-					adapter.ID: map[string]interface{}{
-						"url": adapter.RemoteUrl,
-						"headers": map[string]string{
-							"Authorization": "Bearer adapter-session-token",
-						},
-					},
-				},
-			},
-			"vscode": map[string]interface{}{
-				"inputs": []interface{}{},
-				"servers": map[string]interface{}{
-					adapter.ID: map[string]interface{}{
-						"type": "http",
-						"url":  adapter.RemoteUrl,
-						"headers": map[string]string{
-							"Authorization": "Bearer adapter-session-token",
-						},
-					},
-				},
-			},
-		}
-	} else if adapter.ConnectionType == models.ConnectionTypeStreamableHttp {
-		mcpClientConfig = map[string]interface{}{
-			"gemini": map[string]interface{}{
-				"mcpServers": map[string]interface{}{
-					adapter.ID: map[string]interface{}{
-						"httpUrl": fmt.Sprintf("http://localhost:8911/api/v1/adapters/%s/mcp", adapter.ID),
-						"headers": map[string]string{
-							"Authorization": "Bearer adapter-session-token",
-						},
-					},
-				},
-			},
-			"vscode": map[string]interface{}{
-				"servers": map[string]interface{}{
-					adapter.ID: map[string]interface{}{
-						"url": fmt.Sprintf("http://localhost:8911/api/v1/adapters/%s/mcp", adapter.ID),
-						"headers": map[string]string{
-							"Authorization": "Bearer adapter-session-token",
-						},
-						"type": "http",
-					},
-				},
-				"inputs": []interface{}{},
-			},
-		}
-	} else {
-		// For other connection types (stdio, etc.), use stdio format
-		mcpClientConfig = map[string]interface{}{"stdio": "format"}
-	}
+	// Use includeSecrets=false to return placeholder tokens for creation response
+	// userID is already set above from request header
+	adapterClientConfig := h.generateClientConfig(adapter, userID, false)
 
 	response := CreateAdapterResponse{
 		ID:              adapter.ID,
 		MCPServerID:     req.MCPServerID,
-		MCPClientConfig: mcpClientConfig,
+		MCPClientConfig: adapterClientConfig, // Use the generated config
 		Capabilities:    adapter.MCPFunctionality,
 		Status:          "ready",
 		CreatedAt:       adapter.CreatedAt,
@@ -266,6 +314,14 @@ func (h *AdapterHandler) CreateAdapter(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListAdapters lists all adapters for the current user
+// @Summary List adapters
+// @Description List all adapters for the current user
+// @Tags adapters
+// @Produce json
+// @Param X-User-ID header string false "User ID" default(default-user)
+// @Success 200 {array} models.AdapterResource "List of adapters"
+// @Failure 500 {object} ErrorResponse "Internal server error"
+// @Router /api/v1/adapters [get]
 func (h *AdapterHandler) ListAdapters(w http.ResponseWriter, r *http.Request) {
 	logging.AdapterLogger.Info("ListAdapters handler invoked")
 	if r.Method != http.MethodGet {
@@ -290,37 +346,16 @@ func (h *AdapterHandler) ListAdapters(w http.ResponseWriter, r *http.Request) {
 	listAdapters := make([]map[string]interface{}, len(adapters))
 	for i, adapter := range adapters {
 		// Generate MCP client configurations for different client types
-		mcpClientConfig := map[string]interface{}{
-			"gemini": map[string]interface{}{
-				"mcpServers": map[string]interface{}{
-					adapter.ID: map[string]interface{}{
-						"httpUrl": adapter.URL,
-						"headers": map[string]string{
-							"Authorization": "Bearer adapter-session-token",
-						},
-					},
-				},
-			},
-			"vscode": map[string]interface{}{
-				"servers": map[string]interface{}{
-					adapter.ID: map[string]interface{}{
-						"url": adapter.URL,
-						"headers": map[string]string{
-							"Authorization": "Bearer adapter-session-token",
-						},
-						"type": "http",
-					},
-				},
-				"inputs": []interface{}{},
-			},
-		}
+		// Use includeSecrets=false to return placeholder tokens for list view
+		// userID is already set above from request header
+		adapterClientConfig := h.generateClientConfig(&adapter, userID, false)
 
 		adapterMap := map[string]interface{}{
 			"id":              adapter.ID,
 			"name":            adapter.Name,
 			"description":     adapter.Description,
-			"url":             adapter.URL,
-			"mcpClientConfig": mcpClientConfig,
+			"url":             adapter.URL,         // This is the proxy URL
+			"mcpClientConfig": adapterClientConfig, // Use the generated config
 			"capabilities":    adapter.MCPFunctionality,
 			"status":          adapter.Status,
 			"createdAt":       adapter.CreatedAt,
@@ -446,7 +481,7 @@ func (h *AdapterHandler) UpdateAdapter(w http.ResponseWriter, r *http.Request) {
 	updateAdapter.LastUpdatedAt = time.Now().UTC()
 
 	// Update adapter
-	if err := h.adapterService.UpdateAdapter(r.Context(), userID, updateAdapter); err != nil {
+	if err := h.adapterService.UpdateAdapter(r.Context(), userID, updateAdapter, h.userGroupService); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to update adapter: " + err.Error()})
@@ -533,7 +568,7 @@ func (h *AdapterHandler) DeleteAdapter(w http.ResponseWriter, r *http.Request) {
 	// Note: Sidecar cleanup is handled automatically by the adapter service
 
 	// Delete the adapter
-	if err := h.adapterService.DeleteAdapter(r.Context(), userID, adapterID); err != nil {
+	if err := h.adapterService.DeleteAdapter(r.Context(), userID, adapterID, h.userGroupService); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		if err.Error() == "adapter not found" {
 			w.WriteHeader(http.StatusNotFound)
@@ -898,4 +933,269 @@ func (h *AdapterHandler) SyncAdapterCapabilities(w http.ResponseWriter, r *http.
 		"status":  "capabilities_synced",
 		"message": "Adapter capabilities have been synchronized",
 	})
+}
+
+// AssignAdapterToGroup assigns an adapter to a group
+// @Summary Assign adapter to group
+// @Description Assign an adapter to a specific group with permissions
+// @Tags adapters
+// @Accept json
+// @Produce json
+// @Param X-User-ID header string false "User ID" default(default-user)
+// @Param name path string true "Adapter Name"
+// @Param request body AddAdapterToGroupRequest true "Assignment details"
+// @Success 201 {object} map[string]string
+// @Failure 400 {object} ErrorResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /api/v1/adapters/{name}/groups [post]
+func (h *AdapterHandler) AssignAdapterToGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract adapter ID from URL path
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/adapters/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 || parts[1] != "groups" {
+		http.NotFound(w, r)
+		return
+	}
+	adapterID := parts[0]
+
+	userID := r.Header.Get("X-User-ID")
+	if userID == "" {
+		userID = "default-user"
+	}
+
+	var req AddAdapterToGroupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON: " + err.Error()})
+		return
+	}
+
+	if req.GroupID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "groupId is required"})
+		return
+	}
+
+	permission := req.Permission
+	if permission == "" {
+		permission = "read"
+	}
+
+	if err := h.adapterService.AssignAdapterToGroup(r.Context(), userID, adapterID, req.GroupID, permission, h.userGroupService); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(err.Error(), "not found") {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Resource not found: " + err.Error()})
+		} else if strings.Contains(err.Error(), "permissions") {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+		} else if strings.Contains(err.Error(), "already exists") {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to assign adapter: " + err.Error()})
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "assigned",
+		"message": fmt.Sprintf("Adapter %s assigned to group %s", adapterID, req.GroupID),
+	})
+}
+
+// RemoveAdapterFromGroup removes an adapter from a group
+// @Summary Remove adapter from group
+// @Description Remove an adapter assignment from a specific group
+// @Tags adapters
+// @Produce json
+// @Param X-User-ID header string false "User ID" default(default-user)
+// @Param name path string true "Adapter Name"
+// @Param groupId path string true "Group ID"
+// @Success 204 "No Content"
+// @Failure 400 {object} ErrorResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /api/v1/adapters/{name}/groups/{groupId} [delete]
+func (h *AdapterHandler) RemoveAdapterFromGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract adapter ID and group ID from URL path
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/adapters/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 3 || parts[1] != "groups" {
+		http.NotFound(w, r)
+		return
+	}
+	adapterID := parts[0]
+	groupID := parts[2]
+
+	userID := r.Header.Get("X-User-ID")
+	if userID == "" {
+		userID = "default-user"
+	}
+
+	if err := h.adapterService.RemoveAdapterFromGroup(r.Context(), userID, adapterID, groupID, h.userGroupService); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(err.Error(), "not found") {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Resource not found: " + err.Error()})
+		} else if strings.Contains(err.Error(), "permissions") {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to remove assignment: " + err.Error()})
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ListAdapterGroupAssignments lists all group assignments for an adapter
+// @Summary List adapter group assignments
+// @Description List all groups that have access to this adapter
+// @Tags adapters
+// @Produce json
+// @Param X-User-ID header string false "User ID" default(default-user)
+// @Param name path string true "Adapter Name"
+// @Success 200 {array} models.AdapterGroupAssignment
+// @Failure 403 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /api/v1/adapters/{name}/groups [get]
+func (h *AdapterHandler) ListAdapterGroupAssignments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract adapter ID from URL path
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/adapters/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 || parts[1] != "groups" {
+		http.NotFound(w, r)
+		return
+	}
+	adapterID := parts[0]
+
+	userID := r.Header.Get("X-User-ID")
+	if userID == "" {
+		userID = "default-user"
+	}
+
+	logging.AdapterLogger.Info("ListAdapterAssignments handler: user=%s, adapter=%s", userID, adapterID)
+
+	assignments, err := h.adapterService.ListAdapterAssignments(r.Context(), userID, adapterID, h.userGroupService)
+	if err != nil {
+		logging.AdapterLogger.Error("ListAdapterAssignments failed: user=%s, adapter=%s, error=%v", userID, adapterID, err)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(err.Error(), "not found") {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Adapter not found"})
+		} else if strings.Contains(err.Error(), "denied") {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Access denied"})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to list assignments: " + err.Error()})
+		}
+		return
+	}
+
+	logging.AdapterLogger.Info("ListAdapterAssignments success: user=%s, adapter=%s, count=%d", userID, adapterID, len(assignments))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(assignments)
+}
+
+// GetClientConfig returns the client configuration for all adapters the user has access to
+// @Summary Get client configuration
+// @Description Get the aggregated client configuration for all adapters the user has access to
+// @Tags adapters
+// @Produce json
+// @Param X-User-ID header string false "User ID" default(default-user)
+// @Success 200 {object} map[string]interface{}
+// @Failure 500 {object} ErrorResponse "Internal server error"
+// @Router /api/v1/user/config [get]
+func (h *AdapterHandler) GetClientConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Header.Get("X-User-ID")
+	if userID == "" {
+		userID = "default-user"
+	}
+
+	adapters, err := h.adapterService.ListAdapters(r.Context(), userID, h.userGroupService)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to list adapters: " + err.Error()})
+		return
+	}
+
+	// Initialize response structure
+	finalGeminiServers := make(map[string]interface{})
+	finalVscodeServers := make(map[string]interface{})
+
+	logging.AdapterLogger.Info("GetClientConfig: processing %d adapters for user %s", len(adapters), userID)
+
+	for _, adapter := range adapters {
+		// Generate client config for this adapter, including real tokens
+		// userID is already set above from request header
+		adapterClientConfig := h.generateClientConfig(&adapter, userID, true)
+
+		logging.AdapterLogger.Info("GetClientConfig: generated config for adapter %s: %+v", adapter.Name, adapterClientConfig)
+
+		if geminiConfig, ok := adapterClientConfig["gemini"].(map[string]interface{}); ok {
+			if mcpServers, ok := geminiConfig["mcpServers"].(map[string]interface{}); ok {
+				for k, v := range mcpServers {
+					finalGeminiServers[k] = v
+				}
+			}
+		}
+
+		if vscodeConfig, ok := adapterClientConfig["vscode"].(map[string]interface{}); ok {
+			if servers, ok := vscodeConfig["servers"].(map[string]interface{}); ok {
+				for k, v := range servers {
+					finalVscodeServers[k] = v
+				}
+			}
+		}
+	}
+
+	response := map[string]interface{}{
+		"mcpClientConfig": map[string]interface{}{
+			"gemini": map[string]interface{}{
+				"mcpServers": finalGeminiServers,
+			},
+			"vscode": map[string]interface{}{
+				"servers": finalVscodeServers,
+				"inputs":  []interface{}{}, // Inputs are not aggregated from individual adapters
+			},
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }

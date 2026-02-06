@@ -119,9 +119,152 @@ Get scan results:
 curl -X GET "http://{IP ADDRESS}:8912/api/v1/discovery/results"
 ```
 
+## User and Group Management
+
+### Create a User
+
+Create a new user who will access the adapters:
+
+```bash
+curl -X POST "http://{IP ADDRESS}:8911/api/v1/users" \
+  -H "Content-Type: application/json" \
+  -H "X-User-ID: admin" \
+  -d '{
+    "username": "developer",
+    "email": "dev@example.com",
+    "password": "securepassword",
+    "roles": ["user"]
+  }'
+```
+
+### Create a Group
+
+Create a group to manage access to specific adapters:
+
+```bash
+curl -X POST "http://{IP ADDRESS}:8911/api/v1/groups" \
+  -H "Content-Type: application/json" \
+  -H "X-User-ID: admin" \
+  -d '{
+    "name": "backend-team",
+    "description": "Backend developers",
+    "permissions": []
+  }'
+```
+
+### Add User to Group
+
+Add the developer user to the backend-team group:
+
+```bash
+curl -X POST "http://{IP ADDRESS}:8911/api/v1/groups/backend-team/users" \
+  -H "Content-Type: application/json" \
+  -H "X-User-ID: admin" \
+  -d '{
+    "userId": "developer"
+  }'
+```
+
+### Assign Adapter to Group
+
+Give the backend-team group access to the uyuni-adapter:
+
+```bash
+curl -X POST "http://{IP ADDRESS}:8911/api/v1/adapters/uyuni-adapter/groups" \
+  -H "Content-Type: application/json" \
+  -H "X-User-ID: admin" \
+  -d '{
+    "groupId": "backend-team",
+    "permission": "read"
+  }'
+```
+
+Now any user in the `backend-team` group can access the `uyuni-adapter`.
+
+## Get User-Specific Configuration (Per-User Tokens)
+
+Each user gets unique tokens for secure adapter access. When a user requests their configuration, the system automatically generates per-user tokens.
+
+### Get Your User Config
+
+```bash
+curl -X GET "http://{IP ADDRESS}:8911/api/v1/user/config" \
+  -H "X-User-ID: developer"
+```
+
+**Response includes per-user tokens:**
+
+```json
+{
+  "mcpClientConfig": {
+    "gemini": {
+      "mcpServers": {
+        "uyuni-adapter": {
+          "headers": {
+            "Authorization": "Bearer uat-developer-uyuni-adapter-aBc123...",
+            "X-User-ID": "developer"
+          },
+          "httpUrl": "http://localhost:8911/api/v1/adapters/uyuni-adapter/mcp"
+        }
+      }
+    },
+    "vscode": {
+      "inputs": [],
+      "servers": {
+        "uyuni-adapter": {
+          "headers": {
+            "Authorization": "Bearer uat-developer-uyuni-adapter-aBc123...",
+            "X-User-ID": "developer"
+          },
+          "type": "http",
+          "url": "http://localhost:8911/api/v1/adapters/uyuni-adapter/mcp"
+        }
+      }
+    }
+  }
+}
+```
+
+### Key Points:
+
+- **Unique per user**: Each user gets their own token (`uat-{userID}-{adapterID}-{random}`)
+- **Auto-generated**: Created when user requests config
+- **X-User-ID included**: Always sent for user identification
+- **Group membership required**: User must be in a group with `adapter:read` permission that's assigned to the adapter
+
+### Testing with mcpinspector
+
+```bash
+# Get user token from config
+TOKEN=$(curl -s "http://{IP ADDRESS}:8911/api/v1/user/config" \
+  -H "X-User-ID: developer" | jq -r '.mcpClientConfig.gemini.mcpServers["uyuni-adapter"].headers.Authorization' | sed 's/Bearer //')
+
+# Test with mcpinspector
+mcpinspector "http://{IP ADDRESS}:8911/api/v1/adapters/uyuni-adapter/mcp" \
+  --header "Authorization: Bearer ${TOKEN}" \
+  --header "X-User-ID: developer"
+```
+
+
+### Note
+Gemini has currently a bug when it try to use remote servers like Github that require Oauth flow using browser.
+Problem has been fixed via google-gemini/gemini-cli#5397 (comment)
+
+```JSON
+  "mcpServers": {
+    "github-remote-adapter": {
+      "httpUrl": "https://api.githubcopilot.com/mcp/",
+      "oauth": {
+        "enabled": true,
+        "clientId": "your-own-github-client-ID",
+        "clientSecret": "your-github-client-Secret"
+      },
+    }
+```
+
+  
 ## Next Steps
 
 - Explore full [EXAMPLES.md](examples/EXAMPLES.md) for advanced usage
 - Check [README.md](README.md) for architecture details
-- Visit [GitHub Issues](https://github.com/suse/suse-ai-up/issues) for support</content>
-<parameter name="filePath">/Users/alessandrofesta/Documents/innovation/suse-ai-up/QUICKSTART.md
+- Visit [GitHub Issues](https://github.com/suse/suse-ai-up/issues) for support
