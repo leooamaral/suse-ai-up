@@ -457,3 +457,23 @@
       templated: true
       type: text
       mandatory: false  
+- name: mymcp
+  image: ghcr.io/leooamaral/mcp-server:0.1.0
+  type: server
+  meta:
+    category: app
+    tags:
+      - python
+    sidecarConfig:
+      commandType: docker
+      command: "docker run -it --rm ghcr.io/leooamaral/mcp-server:0.1.0"
+      port: 8080
+      source: manual-config
+      lastUpdated:
+  about:
+    icon: https://apps.rancher.io/logos/suse-ai-deployer.png
+    title: MY MCP SERVER
+    description: MY MCP SERVER
+  source:
+    commit:
+    project:
