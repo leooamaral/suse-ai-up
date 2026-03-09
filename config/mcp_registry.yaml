@@ -458,7 +458,7 @@
       type: text
       mandatory: false  
 - name: mymcp
-  image: ghcr.io/leooamaral/mcp-server:0.1.0
+  image: ghcr.io/leooamaral/mcp-server:0.1.1
   type: server
   meta:
     category: app
