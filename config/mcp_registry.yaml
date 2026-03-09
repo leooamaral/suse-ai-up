@@ -467,7 +467,7 @@
     sidecarConfig:
       commandType: docker
       command: "docker run -it --rm ghcr.io/leooamaral/mcp-server:0.1.0"
-      port: 8080
+      port: 8000
       source: manual-config
       lastUpdated:
   about:
